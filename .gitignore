@@ -1,0 +1,11 @@
+# IDE
+.vscode/
+
+# Builds
+target/
+
+# Cargo
+Cargo.lock
+
+# UTILITIES
+code_sync.py

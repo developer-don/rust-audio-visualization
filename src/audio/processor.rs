@@ -18,11 +18,10 @@ pub struct AudioProcessor {
     fft_size: usize,
     // Hann window values
     // We use a hann window to help pre process audio into pretty packages before
-    // running other logic on audio chunks via FFT
+    // running other logic on those chunks via FFT
     window: Vec<f32>,
     fft_input_buffer: Vec<Complex<f32>>,
     fft_output_buffer: Vec<Complex<f32>>,
-    // For incomplete chunks
     sample_buffer: Vec<f32>,
 }
 
@@ -46,7 +45,6 @@ impl AudioProcessor {
             window,
             fft_input_buffer: vec![Complex::new(0.0, 0.0); fft_size],
             fft_output_buffer: vec![Complex::new(0.0, 0.0); fft_size],
-            // Capacity for buffering
             sample_buffer: Vec::with_capacity(fft_size * 2),
         }
     }
@@ -77,10 +75,7 @@ impl AudioProcessor {
 
             let rms_amplitude = (rms_sum_sq / self.fft_size as f32).sqrt();
 
-            // Perform FFT
             let fft = self.fft_planner.plan_fft_forward(self.fft_size);
-            // Use `process_with_scratch` if input/output buffers are separate & sized correctly
-            // If fft_input_buffer can be modified in place, use fft.process(&mut self.fft_input_buffer);
             fft.process_with_scratch(&mut self.fft_input_buffer, &mut self.fft_output_buffer);
 
             // Calculate frequency magnitudes (power spectrum)
@@ -89,11 +84,11 @@ impl AudioProcessor {
                 .fft_output_buffer
                 .iter()
                 .take(num_freq_bins)
-                .map(|c| c.norm() / self.fft_size as f32) // Calculate magnitude and normalize by N
+                .map(|c| c.norm() / self.fft_size as f32)
                 .collect();
 
             // Remove processed samples from the buffer
-            // drain is efficient for removing from the beginning
+            // drain is efficient enough for removing from the beginning
             self.sample_buffer.drain(0..self.fft_size);
 
             Some(AudioAnalysisData {

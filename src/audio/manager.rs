@@ -161,7 +161,6 @@ impl AudioManager {
                                     // TODO: Could add else here to log `Channel Full` or `data dropped`
                                 }
                             }
-
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => {
                             // Timeouts are expected if playback is paused or buffer underruns occur.

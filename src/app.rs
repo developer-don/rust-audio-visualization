@@ -13,13 +13,11 @@ const NUM_SPHERE_POINTS: usize = 2000;
 const SPHERE_RADIUS: f32 = 1.0;
 const DEFAULT_VOLUME: Option<f32> = Some(0.25);
 
-// Callback only needs color now, point size removed
 struct Custom3DPaintCallback {
     primitive: Arc<crate::visualization::renderer::SphereWgpuPrimitive>,
     mvp_matrix: glam::Mat4,
     queue: Arc<wgpu::Queue>,
-    color: [f32; 3], // Pass calculated color
-                     // point_size removed
+    color: [f32; 3],
 }
 
 impl CallbackTrait for Custom3DPaintCallback {
@@ -29,12 +27,10 @@ impl CallbackTrait for Custom3DPaintCallback {
         render_pass: &mut wgpu::RenderPass<'a>,
         _resources: &'a TypeMap,
     ) {
-        // Call the updated paint_primitive (no point_size arg)
         crate::visualization::renderer::WgpuSphereRenderer::paint_primitive(
             &self.primitive,
             &self.mvp_matrix,
             &self.color,
-            // self.point_size removed
             render_pass,
             &self.queue,
         );
@@ -42,7 +38,6 @@ impl CallbackTrait for Custom3DPaintCallback {
 }
 
 pub struct AudioVisualizerApp {
-    // ... fields remain the same ...
     file_path_input: String,
     audio_manager: Result<AudioManager, String>,
     action_error_message: Option<String>,
@@ -59,9 +54,7 @@ pub struct AudioVisualizerApp {
 }
 
 impl AudioVisualizerApp {
-    // ... new remains the same ...
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        /* ... same as previous ... */
         let sphere_points = generate_sphere_points_fibonacci(SPHERE_RADIUS, NUM_SPHERE_POINTS);
         let mut local_sphere_renderer = WgpuSphereRenderer::new(sphere_points);
         let mut app_wgpu_device_arc = None;
@@ -112,20 +105,14 @@ impl App for AudioVisualizerApp {
             self.current_audio_data = Some(data);
         }
 
-        // Update Renderer State - only extract color now
         let current_color = {
-            // Scope for mutex guard
             let mut renderer_guard = self.sphere_renderer.lock();
             renderer_guard.time += ctx.input(|i| i.stable_dt);
             renderer_guard.update_visual_state(playback_state, &self.current_audio_data);
-            renderer_guard.current_color_rgb // Extract color needed for callback
-                                             // point_size removed
-        }; // Mutex guard drops here
+            renderer_guard.current_color_rgb
+        };
 
-        // --- Draw UI ---
         egui::CentralPanel::default().show(ctx, |ui| {
-            // ... UI Code (Heading, File Path, Volume, Play/Pause, Status) ...
-            // (Same as before, omitted for brevity)
             ui.heading("Audio Visualizer");
             ui.separator();
             ui.horizontal(|ui| {
@@ -306,7 +293,6 @@ impl App for AudioVisualizerApp {
             ui.label(status_message);
             ui.separator();
 
-            // --- Visualization Area ---
             ui.label("3D Point Sphere Visualization:");
             let desired_size = ui.available_size_before_wrap() * egui::vec2(1.0, 0.75);
             let (rect, _response) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
@@ -325,7 +311,6 @@ impl App for AudioVisualizerApp {
 
             if primitive_is_initialized {
                 if let (Some(queue_arc), Some(mvp_matrix)) = (&self.wgpu_queue, mvp_matrix_option) {
-                    // Get the primitive Arc again (cheap clone)
                     let primitive_arc = self
                         .sphere_renderer
                         .lock()
@@ -338,13 +323,11 @@ impl App for AudioVisualizerApp {
                             primitive: primitive_arc,
                             mvp_matrix,
                             queue: queue_arc.clone(),
-                            color: current_color, // Pass color calculated above
-                                                  // point_size removed
+                            color: current_color,
                         },
                     );
                     ui.painter().add(cb);
                 } else {
-                    /* WGPU Queue missing */
                     ui.painter().rect_filled(rect, 0.0, egui::Color32::DARK_RED);
                     ui.painter().text(
                         rect.center(),
@@ -355,7 +338,6 @@ impl App for AudioVisualizerApp {
                     );
                 }
             } else {
-                /* Renderer primitive not initialized */
                 ui.painter()
                     .rect_filled(rect, 0.0, egui::Color32::DARK_GRAY);
                 ui.painter().text(
@@ -366,7 +348,7 @@ impl App for AudioVisualizerApp {
                     egui::Color32::WHITE,
                 );
             }
-        }); // End CentralPanel
+        });
 
         ctx.request_repaint();
     }

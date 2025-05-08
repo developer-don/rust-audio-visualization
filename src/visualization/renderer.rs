@@ -79,10 +79,10 @@ impl WgpuSphereRenderer {
             points: points_data,
             camera_position: Vec3A::new(0.0, 0.0, 4.0), // User's camera position
             time: 0.0,
-            current_scale: 1.25, // User's initial scale
+            current_scale: 1.15, // User's initial scale
             // Initialize color state
             current_hue: 0.0,
-            current_saturation: 0.5,
+            current_saturation: 0.25,
             current_value: 1.0,
             current_color_rgb: hsv_to_rgb(0.0, 0.5, 1.0),
         }
@@ -255,29 +255,30 @@ impl WgpuSphereRenderer {
 
         if playback_state == PlaybackState::Playing {
             if let Some(data) = audio_data {
-                let amplitude_factor = (data.rms_amplitude * 2.0).clamp(0.0, 1.0); // Normalize RMS somewhat
+                let amplitude_factor = (data.rms_amplitude * 3.0).clamp(0.0, 1.0); // Normalize RMS somewhat
                                                                                    // Saturation increases with amplitude
-                target_saturation = 0.5 + amplitude_factor * 0.5;
+                target_saturation = 0.1 + amplitude_factor * 0.9;
                 // Scale increases with amplitude (using user's previous logic)
                 target_scale = 0.75 + (amplitude_factor * 2.5); // Map amplitude to scale (0.75 to 3.25 approx)
             } else {
                 // Playing but no data (silence)
-                target_saturation = 0.5;
+                target_saturation = 0.25;
                 target_scale = 0.75; // Minimum scale when silent but playing
             }
         } else {
             // Idle, Paused, Loaded
-            target_saturation = 0.5; // Idle saturation
-            target_scale = 1.25; // User's default idle scale
+            target_saturation = 0.25; // Idle saturation
+            target_scale = 1.33; // User's default idle scale
         }
 
         // Smooth towards target values
-        let lerp_factor = 0.1;
+        let lerp_factor = 0.08;
         self.current_saturation += (target_saturation - self.current_saturation) * lerp_factor;
         self.current_scale += (target_scale - self.current_scale) * lerp_factor;
 
         // Clamp scale (using user's previous clamping)
         self.current_scale = self.current_scale.clamp(0.75, 7.50);
+        // self.current_saturation = self.current_saturation.clamp(0.0, 1.0);
 
         // Convert final HSV to RGB
         self.current_color_rgb = hsv_to_rgb(
@@ -343,6 +344,7 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [f32; 3] {
     if s <= 0.0 {
         return [v, v, v];
     }
+
     let h_scaled = h * 6.0;
     let sector = h_scaled.floor();
     let f = h_scaled - sector;

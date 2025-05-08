@@ -1,20 +1,25 @@
-use crate::audio::manager::{AudioManager, PlaybackState};
+use crate::audio::{AudioAnalysisData, AudioManager, PlaybackState};
 use crate::visualization::{
     renderer::WgpuSphereRenderer, sphere_geometry::generate_sphere_points_fibonacci,
 };
 use eframe::{egui, egui_wgpu::CallbackTrait, App, Frame};
+use parking_lot::Mutex;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use type_map::concurrent::TypeMap;
 use wgpu;
 
 const NUM_SPHERE_POINTS: usize = 2000;
 const SPHERE_RADIUS: f32 = 1.0;
+const DEFAULT_VOLUME: Option<f32> = Some(0.25);
 
+// Callback only needs color now, point size removed
 struct Custom3DPaintCallback {
     primitive: Arc<crate::visualization::renderer::SphereWgpuPrimitive>,
     mvp_matrix: glam::Mat4,
     queue: Arc<wgpu::Queue>,
+    color: [f32; 3], // Pass calculated color
+                     // point_size removed
 }
 
 impl CallbackTrait for Custom3DPaintCallback {
@@ -22,81 +27,107 @@ impl CallbackTrait for Custom3DPaintCallback {
         &'a self,
         _info: egui::PaintCallbackInfo,
         render_pass: &mut wgpu::RenderPass<'a>,
-        // Required by the CallbackTrait paint method signature, but we use self.queue as a workaround for now.
         _resources: &'a TypeMap,
     ) {
+        // Call the updated paint_primitive (no point_size arg)
         crate::visualization::renderer::WgpuSphereRenderer::paint_primitive(
             &self.primitive,
             &self.mvp_matrix,
+            &self.color,
+            // self.point_size removed
             render_pass,
-            // TODO: This currently works, but look at using resources.get instead.
-            // Use the queue stored in this struct instead of the resources.get
             &self.queue,
         );
     }
 }
 
-// TODO: Remove `wgpu_device` if we're only going to pass it around as part of common patterns.
-#[allow(dead_code)]
 pub struct AudioVisualizerApp {
+    // ... fields remain the same ...
     file_path_input: String,
     audio_manager: Result<AudioManager, String>,
     action_error_message: Option<String>,
-    sphere_renderer: WgpuSphereRenderer,
-    // Store WGPU device and queue.
+    sphere_renderer: Arc<Mutex<WgpuSphereRenderer>>,
+    #[allow(dead_code)]
     wgpu_device: Option<Arc<wgpu::Device>>,
     wgpu_queue: Option<Arc<wgpu::Queue>>,
+    audio_analysis_receiver: mpsc::Receiver<AudioAnalysisData>,
+    analysis_sender: mpsc::SyncSender<AudioAnalysisData>,
+    current_audio_data: Option<AudioAnalysisData>,
+    volume: f32,
+    pre_mute_volume: f32,
+    is_muted: bool,
 }
 
 impl AudioVisualizerApp {
+    // ... new remains the same ...
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        /* ... same as previous ... */
         let sphere_points = generate_sphere_points_fibonacci(SPHERE_RADIUS, NUM_SPHERE_POINTS);
-        let mut sphere_renderer = WgpuSphereRenderer::new(sphere_points);
-
+        let mut local_sphere_renderer = WgpuSphereRenderer::new(sphere_points);
         let mut app_wgpu_device_arc = None;
         let mut app_wgpu_queue_arc = None;
-
         if let Some(wgpu_render_state) = &cc.wgpu_render_state {
-            // Clone Device and Queue Arcs for storing
             let device_arc = wgpu_render_state.device.clone();
             let queue_arc = wgpu_render_state.queue.clone();
-
-            if let Err(e) =
-                sphere_renderer.prepare(&device_arc, &queue_arc, wgpu_render_state.target_format)
-            {
+            let target_format = wgpu_render_state.target_format;
+            if let Err(e) = local_sphere_renderer.prepare(&device_arc, target_format) {
                 tracing::error!("Failed to prepare WGPU sphere renderer: {}", e);
+            } else {
+                app_wgpu_device_arc = Some(device_arc);
+                app_wgpu_queue_arc = Some(queue_arc);
             }
-            app_wgpu_device_arc = Some(device_arc);
-            app_wgpu_queue_arc = Some(queue_arc);
         } else {
-            tracing::warn!(
-                "WGPU render state not available at creation. Visualization might not work."
-            );
+            tracing::warn!("WGPU render state not available at creation.");
         }
+        let sphere_renderer_shared = Arc::new(Mutex::new(local_sphere_renderer));
+        let (analysis_sender, audio_analysis_receiver) = mpsc::sync_channel(10);
 
         Self {
-            file_path_input: String::new(),
-            audio_manager: AudioManager::new(),
+            file_path_input: "/Users/donald/Downloads/example.mp3".to_string(),
+            audio_manager: AudioManager::new(DEFAULT_VOLUME),
             action_error_message: None,
-            sphere_renderer,
+            sphere_renderer: sphere_renderer_shared,
             wgpu_device: app_wgpu_device_arc,
             wgpu_queue: app_wgpu_queue_arc,
+            audio_analysis_receiver,
+            analysis_sender,
+            current_audio_data: None,
+            volume: DEFAULT_VOLUME.unwrap_or(0.25),
+            pre_mute_volume: DEFAULT_VOLUME.unwrap_or(0.25),
+            is_muted: false,
         }
     }
 }
 
 impl App for AudioVisualizerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
+        let playback_state = self
+            .audio_manager
+            .as_ref()
+            .map_or(PlaybackState::Idle, |m| m.get_state());
         if let Ok(manager) = &mut self.audio_manager {
             manager.check_and_update_finished_state();
         }
-        self.sphere_renderer.time += ctx.input(|i| i.stable_dt);
+        while let Ok(data) = self.audio_analysis_receiver.try_recv() {
+            self.current_audio_data = Some(data);
+        }
 
+        // Update Renderer State - only extract color now
+        let current_color = {
+            // Scope for mutex guard
+            let mut renderer_guard = self.sphere_renderer.lock();
+            renderer_guard.time += ctx.input(|i| i.stable_dt);
+            renderer_guard.update_visual_state(playback_state, &self.current_audio_data);
+            renderer_guard.current_color_rgb // Extract color needed for callback
+                                             // point_size removed
+        }; // Mutex guard drops here
+
+        // --- Draw UI ---
         egui::CentralPanel::default().show(ctx, |ui| {
+            // ... UI Code (Heading, File Path, Volume, Play/Pause, Status) ...
+            // (Same as before, omitted for brevity)
             ui.heading("Audio Visualizer");
             ui.separator();
-
-            // Audio Controls UI
             ui.horizontal(|ui| {
                 ui.label("Audio File Path (MP3):");
                 ui.add_sized(
@@ -106,12 +137,46 @@ impl App for AudioVisualizerApp {
                 );
             });
             ui.add_space(5.0);
+            ui.horizontal(|ui| {
+                ui.label("Volume:");
+                let _slider_enabled = !self.is_muted;
+                let volume_slider = ui.add(
+                    egui::Slider::new(&mut self.volume, 0.0..=1.0)
+                        .logarithmic(false)
+                        .show_value(true)
+                        .clamp_to_range(true)
+                        .min_decimals(2),
+                );
+                if volume_slider.changed() {
+                    self.is_muted = false;
+                    self.pre_mute_volume = self.volume;
+                    if let Ok(manager) = &mut self.audio_manager {
+                        manager.set_output_volume(self.volume);
+                    }
+                }
+                let mute_button_text = if self.is_muted { "Unmute" } else { "Mute" };
+                if ui.button(mute_button_text).clicked() {
+                    self.is_muted = !self.is_muted;
+                    let new_volume;
+                    if self.is_muted {
+                        self.pre_mute_volume = self.volume;
+                        new_volume = 0.0;
+                        self.volume = 0.0;
+                    } else {
+                        new_volume = self.pre_mute_volume;
+                        self.volume = self.pre_mute_volume;
+                    }
+                    if let Ok(manager) = &mut self.audio_manager {
+                        manager.set_output_volume(new_volume);
+                    }
+                }
+            });
+            ui.add_space(5.0);
             let (play_button_text, play_button_enabled) = match &self.audio_manager {
                 Ok(manager) => {
                     let current_path_is_target = manager
                         .get_current_file_path()
                         .map_or(false, |p| p == &self.file_path_input);
-
                     match manager.get_state() {
                         PlaybackState::Idle => ("Play", !self.file_path_input.is_empty()),
                         PlaybackState::Loaded => {
@@ -150,37 +215,28 @@ impl App for AudioVisualizerApp {
                 Err(_) => false,
             };
             ui.horizontal(|ui| {
-                // Play Click Handler
                 if ui
                     .add_enabled(play_button_enabled, egui::Button::new(play_button_text))
                     .clicked()
                 {
                     if let Ok(manager) = &mut self.audio_manager {
                         self.action_error_message = None;
-                        let mut op_result: Result<(), String> = Ok(());
                         let current_manager_state = manager.get_state();
                         let manager_knows_current_file = manager
                             .get_current_file_path()
                             .map_or(false, |p| p == &self.file_path_input);
                         let input_is_empty_but_manager_has_file = self.file_path_input.is_empty()
                             && manager.get_current_file_path().is_some();
+                        let mut op_result: Result<(), String> = Ok(());
                         match current_manager_state {
-                            PlaybackState::Idle => {
-                                op_result = manager.load_and_play_file(&self.file_path_input);
-                            }
-                            PlaybackState::Loaded => {
-                                if manager_knows_current_file || input_is_empty_but_manager_has_file
-                                {
-                                    manager.resume_playback();
-                                } else {
-                                    op_result = manager.load_and_play_file(&self.file_path_input);
-                                }
-                            }
                             PlaybackState::Playing => {
                                 if manager_knows_current_file {
                                     manager.pause_playback();
                                 } else {
-                                    op_result = manager.load_and_play_file(&self.file_path_input);
+                                    op_result = manager.load_and_play_file(
+                                        &self.file_path_input,
+                                        self.analysis_sender.clone(),
+                                    );
                                 }
                             }
                             PlaybackState::Paused => {
@@ -188,7 +244,27 @@ impl App for AudioVisualizerApp {
                                 {
                                     manager.resume_playback();
                                 } else {
-                                    op_result = manager.load_and_play_file(&self.file_path_input);
+                                    op_result = manager.load_and_play_file(
+                                        &self.file_path_input,
+                                        self.analysis_sender.clone(),
+                                    );
+                                }
+                            }
+                            PlaybackState::Idle | PlaybackState::Loaded => {
+                                let target_path = if self.file_path_input.is_empty()
+                                    && manager.get_current_file_path().is_some()
+                                {
+                                    manager.get_current_file_path().unwrap().clone()
+                                } else {
+                                    self.file_path_input.clone()
+                                };
+                                if !target_path.is_empty() {
+                                    op_result = manager.load_and_play_file(
+                                        &target_path,
+                                        self.analysis_sender.clone(),
+                                    );
+                                } else {
+                                    op_result = Err("No file path provided".to_string());
                                 }
                             }
                         }
@@ -197,8 +273,6 @@ impl App for AudioVisualizerApp {
                         }
                     }
                 }
-
-                // Pause Click Handler
                 if ui
                     .add_enabled(pause_button_explicit_enabled, egui::Button::new("Pause"))
                     .clicked()
@@ -231,51 +305,69 @@ impl App for AudioVisualizerApp {
             };
             ui.label(status_message);
             ui.separator();
-            // End Audio Controls UI
 
-            // Audio Visualization UI
+            // --- Visualization Area ---
             ui.label("3D Point Sphere Visualization:");
-            let desired_size = ui.available_size_before_wrap() * egui::vec2(1.0, 0.8);
+            let desired_size = ui.available_size_before_wrap() * egui::vec2(1.0, 0.75);
             let (rect, _response) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
 
-            if let Some(primitive_arc) = self.sphere_renderer.get_primitive_arc() {
-                if let Some(queue_arc_from_app) = &self.wgpu_queue {
+            let (primitive_is_initialized, mvp_matrix_option) = {
+                let renderer_guard = self.sphere_renderer.lock();
+                let is_init = renderer_guard.get_primitive_arc().is_some();
+                let mvp = if is_init {
                     let aspect_ratio = rect.width() / rect.height();
-                    let mvp_matrix = self.sphere_renderer.calculate_mvp(aspect_ratio);
+                    Some(renderer_guard.calculate_mvp(aspect_ratio))
+                } else {
+                    None
+                };
+                (is_init, mvp)
+            };
+
+            if primitive_is_initialized {
+                if let (Some(queue_arc), Some(mvp_matrix)) = (&self.wgpu_queue, mvp_matrix_option) {
+                    // Get the primitive Arc again (cheap clone)
+                    let primitive_arc = self
+                        .sphere_renderer
+                        .lock()
+                        .get_primitive_arc()
+                        .expect("Primitive should be initialized here");
 
                     let cb = eframe::egui_wgpu::Callback::new_paint_callback(
                         rect,
                         Custom3DPaintCallback {
                             primitive: primitive_arc,
                             mvp_matrix,
-                            queue: queue_arc_from_app.clone(),
+                            queue: queue_arc.clone(),
+                            color: current_color, // Pass color calculated above
+                                                  // point_size removed
                         },
                     );
                     ui.painter().add(cb);
                 } else {
-                    // If we get here, WGPU initialization failed in `AudioVisualizerApp::new`
+                    /* WGPU Queue missing */
                     ui.painter().rect_filled(rect, 0.0, egui::Color32::DARK_RED);
                     ui.painter().text(
                         rect.center(),
                         egui::Align2::CENTER_CENTER,
-                        "WGPU Queue not available for rendering",
+                        "WGPU Queue N/A",
                         egui::FontId::default(),
                         egui::Color32::WHITE,
                     );
                 }
             } else {
+                /* Renderer primitive not initialized */
                 ui.painter()
                     .rect_filled(rect, 0.0, egui::Color32::DARK_GRAY);
                 ui.painter().text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
-                    "Renderer not initialized",
+                    "Renderer N/A",
                     egui::FontId::default(),
                     egui::Color32::WHITE,
                 );
             }
-        });
+        }); // End CentralPanel
 
-        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        ctx.request_repaint();
     }
 }

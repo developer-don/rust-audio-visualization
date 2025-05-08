@@ -34,11 +34,12 @@ pub struct AudioManager {
     stop_signal_sender: Option<mpsc::Sender<()>>,
     current_file_path: Option<String>,
     state: PlaybackState,
+    current_volume: f32,
 }
 
 impl AudioManager {
     // Creates a new AudioManager.
-    pub fn new() -> Result<Self, String> {
+    pub fn new(volume: Option<f32>) -> Result<Self, String> {
         let (stream, stream_handle) = OutputStream::try_default()
             .map_err(|e| format!("Failed to open output stream: {}", e))?;
 
@@ -50,7 +51,19 @@ impl AudioManager {
             stop_signal_sender: None,
             current_file_path: None,
             state: PlaybackState::Idle,
+            current_volume: volume.unwrap_or(0.0).clamp(0.0, 1.0),
         })
+    }
+
+    pub fn set_output_volume(&mut self, volume: f32) {
+        // Clamp volume to a reasonable range (e.g., 0.0 to 1.0)
+        self.current_volume = volume.clamp(0.0, 1.0);
+        tracing::debug!("Setting output volume to: {}", self.current_volume);
+
+        // Apply to the current sink if it exists
+        if let Some(sink) = &self.sink {
+            sink.set_volume(self.current_volume);
+        }
     }
 
     // Loads and plays the specified MP3 file, begins audio processing.
@@ -173,6 +186,9 @@ impl AudioManager {
             SampleBroadcaster::new(decoder_f32, sample_chunk_sender, SAMPLES_PER_CHUNK);
         let sink = Sink::try_new(&self.stream_handle)
             .map_err(|e| format!("Failed to create sink: {}", e))?;
+
+        // Apply the current volume to the new sink
+        sink.set_volume(self.current_volume);
 
         // Play the broadcaster source
         sink.append(broadcaster);

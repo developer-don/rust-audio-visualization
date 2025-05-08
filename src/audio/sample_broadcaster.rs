@@ -1,8 +1,9 @@
 use rodio::Source;
-// Not the most performant option, but for now this will keep things simpler.
-// we can look at using `crossbeam-channel` (or `flume`?) in the future.
 use std::sync::mpsc;
 use std::time::Duration;
+
+// TODO: `std::sync::mpsc` is not the most performant option, but for now it works.
+// Can look at using `crossbeam-channel` (or `flume`?) in the future.
 
 // Wrap audio source and send clones of sample chunks through a channel.
 #[allow(dead_code)]
@@ -90,7 +91,7 @@ where
                         }
                         Err(mpsc::TrySendError::Disconnected(_)) => {
                             // Processing thread might have panicked if we get here... for some reason.
-                            // Could potentially stop the source here, but for now just log.
+                            // Could potentially stop the source here, log for now.
                             tracing::error!("Sample chunk channel disconnected.");
                         }
                     }
@@ -111,7 +112,7 @@ where
                         Err(e) => tracing::error!("Failed to send final sample chunk: {}", e),
                     }
 
-                    // Reset buffer, we're done.
+                    // Reset buffer, we're done
                     self.buffer.clear();
                 }
 

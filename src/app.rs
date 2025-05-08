@@ -10,6 +10,7 @@ use wgpu; // Required for Arc<wgpu::Queue> things
 
 const NUM_SPHERE_POINTS: usize = 2000;
 const SPHERE_RADIUS: f32 = 1.0;
+const DEFAULT_VOLUME: Option<f32> = Some(0.25);
 
 // Callback stores queue obtained from App state
 struct Custom3DPaintCallback {
@@ -50,6 +51,10 @@ pub struct AudioVisualizerApp {
     audio_analysis_receiver: mpsc::Receiver<AudioAnalysisData>,
     analysis_sender: mpsc::SyncSender<AudioAnalysisData>,
     current_audio_data: Option<AudioAnalysisData>,
+
+    volume: f32,
+    pre_mute_volume: f32,
+    is_muted: bool,
 }
 
 impl AudioVisualizerApp {
@@ -83,10 +88,11 @@ impl AudioVisualizerApp {
         // Create bounded channel to receive derived meta info from audio analysis
         // Bounded channel will prevent excessive memory usage if UI lags
         let (analysis_sender, audio_analysis_receiver) = mpsc::sync_channel(10);
+        let audio_manager = AudioManager::new(DEFAULT_VOLUME);
 
         Self {
-            file_path_input: String::new(),
-            audio_manager: AudioManager::new(),
+            file_path_input: "/Users/donald/Downloads/example.mp3".to_string(),
+            audio_manager,
             action_error_message: None,
             sphere_renderer,
             wgpu_device: app_wgpu_device_arc,
@@ -94,6 +100,9 @@ impl AudioVisualizerApp {
             audio_analysis_receiver,
             analysis_sender,
             current_audio_data: None,
+            volume: DEFAULT_VOLUME.unwrap_or(0.25),
+            pre_mute_volume: DEFAULT_VOLUME.unwrap_or(0.25),
+            is_muted: false,
         }
     }
 }
@@ -126,7 +135,7 @@ impl App for AudioVisualizerApp {
 
             // Audio Controls
             ui.horizontal(|ui| {
-                /* Input field */
+                // Audio File Path input
                 ui.label("Audio File Path (MP3):");
                 ui.add_sized(
                     ui.available_size_before_wrap(),
@@ -134,7 +143,54 @@ impl App for AudioVisualizerApp {
                         .hint_text("/path/to/your/audio.mp3"),
                 );
             });
+
             ui.add_space(5.0);
+
+            // Volume Slider
+            ui.horizontal(|ui| {
+                let volume_slider = ui.add_enabled(
+                    true,
+                    egui::Slider::new(&mut self.volume, 0.0..=1.0)
+                        .logarithmic(false)
+                        .show_value(true)
+                        .clamp_to_range(true)
+                        .min_decimals(2)
+                        .text("Volume"),
+                );
+
+                // Update audio manager on slider value change
+                if volume_slider.changed() {
+                    self.is_muted = false;
+                    self.pre_mute_volume = self.volume;
+                    if let Ok(manager) = &mut self.audio_manager {
+                        manager.set_output_volume(self.volume);
+                    }
+                }
+
+                // Mute Button
+                let mute_button_text = if self.is_muted { "Unmute" } else { "Mute" };
+                if ui.button(mute_button_text).clicked() {
+                    self.is_muted = !self.is_muted;
+                    let new_volume;
+
+                    if self.is_muted {
+                        self.pre_mute_volume = self.volume;
+                        new_volume = 0.0;
+                        self.volume = 0.0;
+                    } else {
+                        new_volume = self.pre_mute_volume;
+                        self.volume = self.pre_mute_volume;
+                    }
+
+                    if let Ok(manager) = &mut self.audio_manager {
+                        manager.set_output_volume(new_volume);
+                    }
+                }
+            });
+
+            ui.add_space(5.0);
+
+            // Play / Pause Button
             let (play_button_text, play_button_enabled) = match &self.audio_manager {
                 Ok(manager) => {
                     let current_path_is_target = manager
@@ -254,6 +310,7 @@ impl App for AudioVisualizerApp {
                     }
                 }
             });
+
             let status_message = if let Some(err_msg) = &self.action_error_message {
                 format!("Error: {}", err_msg)
             } else {
@@ -279,7 +336,7 @@ impl App for AudioVisualizerApp {
 
             // Point Cloud / Visualization Area
             ui.label("3D Point Sphere Visualization:");
-            let desired_size = ui.available_size_before_wrap() * egui::vec2(1.0, 0.8);
+            let desired_size = ui.available_size_before_wrap() * egui::vec2(1.0, 0.75);
             let (rect, _response) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
 
             if let Some(primitive_arc) = self.sphere_renderer.get_primitive_arc() {

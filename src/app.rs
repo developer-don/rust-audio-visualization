@@ -1,16 +1,17 @@
-use crate::audio::manager::{AudioManager, PlaybackState};
+use crate::audio::{AudioAnalysisData, AudioManager, PlaybackState};
 use crate::visualization::{
     renderer::WgpuSphereRenderer, sphere_geometry::generate_sphere_points_fibonacci,
 };
 use eframe::{egui, egui_wgpu::CallbackTrait, App, Frame};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use type_map::concurrent::TypeMap;
-use wgpu;
+use wgpu; // Required for Arc<wgpu::Queue> things
 
 const NUM_SPHERE_POINTS: usize = 2000;
 const SPHERE_RADIUS: f32 = 1.0;
 
+// Callback stores queue obtained from App state
 struct Custom3DPaintCallback {
     primitive: Arc<crate::visualization::renderer::SphereWgpuPrimitive>,
     mvp_matrix: glam::Mat4,
@@ -22,30 +23,33 @@ impl CallbackTrait for Custom3DPaintCallback {
         &'a self,
         _info: egui::PaintCallbackInfo,
         render_pass: &mut wgpu::RenderPass<'a>,
-        // Required by the CallbackTrait paint method signature, but we use self.queue as a workaround for now.
-        _resources: &'a TypeMap,
+        _resources: &'a TypeMap, // Unused queue source for now
     ) {
         crate::visualization::renderer::WgpuSphereRenderer::paint_primitive(
             &self.primitive,
             &self.mvp_matrix,
             render_pass,
-            // TODO: This currently works, but look at using resources.get instead.
-            // Use the queue stored in this struct instead of the resources.get
+            // Use stored queue
             &self.queue,
         );
     }
 }
 
-// TODO: Remove `wgpu_device` if we're only going to pass it around as part of common patterns.
-#[allow(dead_code)]
 pub struct AudioVisualizerApp {
     file_path_input: String,
     audio_manager: Result<AudioManager, String>,
     action_error_message: Option<String>,
     sphere_renderer: WgpuSphereRenderer,
-    // Store WGPU device and queue.
+
+    // TODO: may ot need `wgpu_device` anymore
+    #[allow(dead_code)]
     wgpu_device: Option<Arc<wgpu::Device>>,
+    // WGPU Queue state needed for callbacks
     wgpu_queue: Option<Arc<wgpu::Queue>>,
+
+    audio_analysis_receiver: mpsc::Receiver<AudioAnalysisData>,
+    analysis_sender: mpsc::SyncSender<AudioAnalysisData>,
+    current_audio_data: Option<AudioAnalysisData>,
 }
 
 impl AudioVisualizerApp {
@@ -56,23 +60,29 @@ impl AudioVisualizerApp {
         let mut app_wgpu_device_arc = None;
         let mut app_wgpu_queue_arc = None;
 
+        // Initialize WGPU resources for the renderer
         if let Some(wgpu_render_state) = &cc.wgpu_render_state {
-            // Clone Device and Queue Arcs for storing
             let device_arc = wgpu_render_state.device.clone();
             let queue_arc = wgpu_render_state.queue.clone();
+            let target_format = wgpu_render_state.target_format;
 
-            if let Err(e) =
-                sphere_renderer.prepare(&device_arc, &queue_arc, wgpu_render_state.target_format)
-            {
+            if let Err(e) = sphere_renderer.prepare(&device_arc, target_format) {
+                // TODO: This is fine as long as we don't mess with the
+                //   render_pipeline (depth_stencil testing)
                 tracing::error!("Failed to prepare WGPU sphere renderer: {}", e);
+            } else {
+                app_wgpu_device_arc = Some(device_arc);
+                app_wgpu_queue_arc = Some(queue_arc);
             }
-            app_wgpu_device_arc = Some(device_arc);
-            app_wgpu_queue_arc = Some(queue_arc);
         } else {
             tracing::warn!(
                 "WGPU render state not available at creation. Visualization might not work."
             );
         }
+
+        // Create bounded channel to receive derived meta info from audio analysis
+        // Bounded channel will prevent excessive memory usage if UI lags
+        let (analysis_sender, audio_analysis_receiver) = mpsc::sync_channel(10);
 
         Self {
             file_path_input: String::new(),
@@ -81,23 +91,42 @@ impl AudioVisualizerApp {
             sphere_renderer,
             wgpu_device: app_wgpu_device_arc,
             wgpu_queue: app_wgpu_queue_arc,
+            audio_analysis_receiver,
+            analysis_sender,
+            current_audio_data: None,
         }
     }
 }
 
 impl App for AudioVisualizerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
+        // Update Audio State
         if let Ok(manager) = &mut self.audio_manager {
             manager.check_and_update_finished_state();
         }
-        self.sphere_renderer.time += ctx.input(|i| i.stable_dt);
 
+        // Receive Audio Analysis Data
+        while let Ok(data) = self.audio_analysis_receiver.try_recv() {
+            // Store the latest data received this frame
+            // If no data received this frame, self.current_audio_data retains the previous value.
+            // TODO: Consider adding logic to fade out effect if no data received for a while?
+            self.current_audio_data = Some(data);
+        }
+
+        // Update the renderer with the latest audio data
+        self.sphere_renderer.time += ctx.input(|i| i.stable_dt);
+        self.sphere_renderer
+            .update_with_audio(&self.current_audio_data);
+
+        // Build / Render UI
+        // TODO  break this UI stuff up into a separate functions
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Audio Visualizer");
             ui.separator();
 
-            // Audio Controls UI
+            // Audio Controls
             ui.horizontal(|ui| {
+                /* Input field */
                 ui.label("Audio File Path (MP3):");
                 ui.add_sized(
                     ui.available_size_before_wrap(),
@@ -111,7 +140,6 @@ impl App for AudioVisualizerApp {
                     let current_path_is_target = manager
                         .get_current_file_path()
                         .map_or(false, |p| p == &self.file_path_input);
-
                     match manager.get_state() {
                         PlaybackState::Idle => ("Play", !self.file_path_input.is_empty()),
                         PlaybackState::Loaded => {
@@ -150,45 +178,64 @@ impl App for AudioVisualizerApp {
                 Err(_) => false,
             };
             ui.horizontal(|ui| {
-                // Play Click Handler
                 if ui
                     .add_enabled(play_button_enabled, egui::Button::new(play_button_text))
                     .clicked()
                 {
                     if let Ok(manager) = &mut self.audio_manager {
                         self.action_error_message = None;
-                        let mut op_result: Result<(), String> = Ok(());
                         let current_manager_state = manager.get_state();
                         let manager_knows_current_file = manager
                             .get_current_file_path()
                             .map_or(false, |p| p == &self.file_path_input);
                         let input_is_empty_but_manager_has_file = self.file_path_input.is_empty()
                             && manager.get_current_file_path().is_some();
+                        let mut op_result: Result<(), String> = Ok(());
+
                         match current_manager_state {
-                            PlaybackState::Idle => {
-                                op_result = manager.load_and_play_file(&self.file_path_input);
-                            }
-                            PlaybackState::Loaded => {
-                                if manager_knows_current_file || input_is_empty_but_manager_has_file
-                                {
-                                    manager.resume_playback();
-                                } else {
-                                    op_result = manager.load_and_play_file(&self.file_path_input);
-                                }
-                            }
                             PlaybackState::Playing => {
+                                // If playing current file -> Pause, else Play New
                                 if manager_knows_current_file {
                                     manager.pause_playback();
                                 } else {
-                                    op_result = manager.load_and_play_file(&self.file_path_input);
+                                    op_result = manager.load_and_play_file(
+                                        &self.file_path_input,
+                                        self.analysis_sender.clone(),
+                                    );
                                 }
                             }
                             PlaybackState::Paused => {
+                                // If paused current file -> Resume, else Play New
                                 if manager_knows_current_file || input_is_empty_but_manager_has_file
                                 {
                                     manager.resume_playback();
                                 } else {
-                                    op_result = manager.load_and_play_file(&self.file_path_input);
+                                    op_result = manager.load_and_play_file(
+                                        &self.file_path_input,
+                                        self.analysis_sender.clone(),
+                                    );
+                                }
+                            }
+                            PlaybackState::Idle | PlaybackState::Loaded => {
+                                // Play new or play loaded
+                                // Check if trying to play the currently loaded file (if any) or a new one
+                                let target_path = if self.file_path_input.is_empty()
+                                    && manager.get_current_file_path().is_some()
+                                {
+                                    manager.get_current_file_path().unwrap().clone()
+                                // Use loaded path if input path is empty
+                                } else {
+                                    // Use file input path
+                                    self.file_path_input.clone()
+                                };
+                                // Play the target file
+                                if !target_path.is_empty() {
+                                    op_result = manager.load_and_play_file(
+                                        &target_path,
+                                        self.analysis_sender.clone(),
+                                    );
+                                } else {
+                                    op_result = Err("No file path provided".to_string());
                                 }
                             }
                         }
@@ -197,8 +244,6 @@ impl App for AudioVisualizerApp {
                         }
                     }
                 }
-
-                // Pause Click Handler
                 if ui
                     .add_enabled(pause_button_explicit_enabled, egui::Button::new("Pause"))
                     .clicked()
@@ -231,16 +276,16 @@ impl App for AudioVisualizerApp {
             };
             ui.label(status_message);
             ui.separator();
-            // End Audio Controls UI
 
-            // Audio Visualization UI
+            // Point Cloud / Visualization Area
             ui.label("3D Point Sphere Visualization:");
             let desired_size = ui.available_size_before_wrap() * egui::vec2(1.0, 0.8);
             let (rect, _response) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
 
             if let Some(primitive_arc) = self.sphere_renderer.get_primitive_arc() {
-                if let Some(queue_arc_from_app) = &self.wgpu_queue {
+                if let Some(queue_arc) = &self.wgpu_queue {
                     let aspect_ratio = rect.width() / rect.height();
+                    // Calculate MVP *after* update_with_audio has potentially changed scale
                     let mvp_matrix = self.sphere_renderer.calculate_mvp(aspect_ratio);
 
                     let cb = eframe::egui_wgpu::Callback::new_paint_callback(
@@ -248,17 +293,16 @@ impl App for AudioVisualizerApp {
                         Custom3DPaintCallback {
                             primitive: primitive_arc,
                             mvp_matrix,
-                            queue: queue_arc_from_app.clone(),
+                            queue: queue_arc.clone(), // Clone Arc for the callback
                         },
                     );
                     ui.painter().add(cb);
                 } else {
-                    // If we get here, WGPU initialization failed in `AudioVisualizerApp::new`
                     ui.painter().rect_filled(rect, 0.0, egui::Color32::DARK_RED);
                     ui.painter().text(
                         rect.center(),
                         egui::Align2::CENTER_CENTER,
-                        "WGPU Queue not available for rendering",
+                        "WGPU Queue not available",
                         egui::FontId::default(),
                         egui::Color32::WHITE,
                     );
@@ -276,6 +320,8 @@ impl App for AudioVisualizerApp {
             }
         });
 
-        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        // TODO: Determine if repaint request interval is needed if we do some heavy things later.
+        // Request repaint continuously for animation and audio updates
+        ctx.request_repaint();
     }
 }

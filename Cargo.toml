@@ -17,6 +17,7 @@ glam = { version = "0.25", features = [
 ] } # For 3D math, bytemuck is required for glam
 rand = "0.8" # For point generation
 rodio = { version = "0.17", features = ["mp3"] }
+rustfft = "6.1" # For Fast Fourier Transform (FFT) analysis of audio track slices
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 type-map = "0.5.0" # Required for egui_wgpu

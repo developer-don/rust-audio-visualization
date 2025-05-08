@@ -1,8 +1,11 @@
+use crate::audio::AudioAnalysisData;
 use anyhow::Result;
 use glam::{Mat4, Vec3A};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
+// Shader source (WGSL)
+// TODO: These will need to be updated for something more than simple uniform scaling
 const SHADERS_WGSL: &str = r#"
 struct VertexInput {
     @location(0) position: vec3<f32>,
@@ -28,12 +31,9 @@ fn fs_main() -> @location(0) vec4<f32> {
 }
 "#;
 
-// TODO: Remove `mvp_bind_group_layout` if we're only going to pass it around.
-#[allow(dead_code)]
 pub struct SphereWgpuPrimitive {
     vertex_buffer: wgpu::Buffer,
     num_vertices: u32,
-    mvp_bind_group_layout: wgpu::BindGroupLayout,
     mvp_uniform_buffer: wgpu::Buffer,
     mvp_bind_group: wgpu::BindGroup,
     render_pipeline: wgpu::RenderPipeline,
@@ -41,26 +41,27 @@ pub struct SphereWgpuPrimitive {
 
 pub struct WgpuSphereRenderer {
     primitive: Option<Arc<SphereWgpuPrimitive>>,
-    points: Vec<[f32; 3]>,
+    points: Vec<[f32; 3]>, // Original points, needed for reset or complex calcs
     camera_position: Vec3A,
-    pub time: f32,
+    pub time: f32,      // Rotation animation
+    current_scale: f32, // Scale factor, driven by audio amplitude calculations
 }
 
 impl WgpuSphereRenderer {
     pub fn new(points_data: Vec<[f32; 3]>) -> Self {
+        // `current_scale` starts with default scale of 1.0
         Self {
             primitive: None,
             points: points_data,
-            camera_position: Vec3A::new(0.0, 0.0, 3.0),
+            camera_position: Vec3A::new(0.0, 0.0, 4.0),
             time: 0.0,
+            current_scale: 1.25,
         }
     }
 
-    // TODO: Remove `queue` from as an argument if we don't end up needing it.
     pub fn prepare(
         &mut self,
         device: &Arc<wgpu::Device>,
-        _queue: &Arc<wgpu::Queue>,
         target_format: wgpu::TextureFormat,
     ) -> Result<()> {
         if self.primitive.is_some() {
@@ -117,6 +118,7 @@ impl WgpuSphereRenderer {
             bind_group_layouts: &[&mvp_bind_group_layout],
             push_constant_ranges: &[],
         });
+
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Sphere Render Pipeline"),
             layout: Some(&pipeline_layout),
@@ -143,10 +145,11 @@ impl WgpuSphereRenderer {
                 strip_index_format: None,
                 front_face: wgpu::FrontFace::Ccw,
                 cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill,
+                polygon_mode: wgpu::PolygonMode::Fill, // Use Fill
                 unclipped_depth: false,
                 conservative: false,
             },
+            // TODO: dig into why this breaks complaining about polygons if not none
             depth_stencil: None,
             multisample: wgpu::MultisampleState {
                 count: 1,
@@ -160,7 +163,6 @@ impl WgpuSphereRenderer {
             vertex_buffer,
             num_vertices,
             mvp_uniform_buffer,
-            mvp_bind_group_layout,
             mvp_bind_group,
             render_pipeline,
         }));
@@ -170,14 +172,41 @@ impl WgpuSphereRenderer {
         Ok(())
     }
 
+    // Update internal state based on audio analysis data
+    pub fn update_with_audio(&mut self, audio_data: &Option<AudioAnalysisData>) {
+        if let Some(data) = audio_data {
+            // Map RMS amplitude to scale.
+            // Clamp the RMS value to avoid extreme scales (e.g., 0.0 to 1.0).
+            // Apply some scaling factor and a minimum size, ensuring non-negative
+            let clamped_rms = data.rms_amplitude.max(0.0);
+            // These factors (1.5, 0.5) are arbitrary
+            // Scales from 0.5 upwards
+            // self.current_scale = 0.5 + (clamped_rms * 1.5);
+            self.current_scale = 0.75 + (clamped_rms * 2.5);
+
+        // TODO: Implement frequency -> color mapping later
+        } else {
+            // No audio data - paused, stopped, or between chunks
+            // Optionally decay the scale back to 1.0 smoothly, or just hold the last value.
+            // self.current_scale = (self.current_scale - 1.0) * 0.95 + 1.0;
+        }
+        // Clamp scale between between 0.1x and 5x to prevent excessive size
+        // self.current_scale = self.current_scale.clamp(0.1, 5.0);
+        self.current_scale = self.current_scale.clamp(0.75, 7.50);
+    }
+
+    // Calculate the Model-View-Projection matrix, incorporating current scale.
     pub fn calculate_mvp(&self, aspect_ratio: f32) -> Mat4 {
         let view = Mat4::look_at_rh(
             self.camera_position.into(),
             Vec3A::ZERO.into(),
             Vec3A::Y.into(),
         );
-        let model =
-            Mat4::from_rotation_y(self.time * 0.4) * Mat4::from_rotation_x(self.time * 0.25);
+        // Apply rotation and then scale
+        let model = Mat4::from_rotation_y(self.time * 0.4)
+            * Mat4::from_rotation_x(self.time * 0.25)
+            * Mat4::from_scale(Vec3A::splat(self.current_scale).into()); // Applies scale uniformly
+
         let proj = Mat4::perspective_rh_gl(std::f32::consts::FRAC_PI_4, aspect_ratio, 0.1, 100.0);
 
         proj * view * model
@@ -188,11 +217,12 @@ impl WgpuSphereRenderer {
     }
 
     pub fn paint_primitive<'rp_lifetime>(
-        primitive: &'rp_lifetime SphereWgpuPrimitive, // Tie primitive's borrow to rp_lifetime
-        mvp_matrix: &Mat4, // mvp_matrix can have its own independent lifetime
-        rpass: &mut wgpu::RenderPass<'rp_lifetime>, // RenderPass needs to use rp_lifetime
+        primitive: &'rp_lifetime SphereWgpuPrimitive,
+        mvp_matrix: &Mat4,
+        rpass: &mut wgpu::RenderPass<'rp_lifetime>,
         queue: &Arc<wgpu::Queue>,
     ) {
+        // Update the MVP uniform buffer with the combined matrix
         queue.write_buffer(
             &primitive.mvp_uniform_buffer,
             0,

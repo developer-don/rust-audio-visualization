@@ -1,12 +1,32 @@
-use crate::audio::AudioAnalysisData;
+use crate::audio::{AudioAnalysisData, PlaybackState};
 use anyhow::Result;
+use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3A};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
-// Shader source (WGSL)
-// TODO: These will need to be updated for something more than simple uniform scaling
+// Uniform struct - Only color
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Pod, Zeroable)]
+struct VisualParamsUniform {
+    // Rust struct name can remain different if desired
+    color: [f32; 4],
+}
+
+// Shader source (WGSL) - Corrected struct usage
 const SHADERS_WGSL: &str = r#"
+// === UNIFORMS ===
+@group(0) @binding(0)
+var<uniform> mvp: mat4x4<f32>;
+
+// Group 1: Visual parameters (Color only)
+struct VisualParams { // Define struct as VisualParams
+    color: vec4<f32>,
+};
+@group(1) @binding(0)
+var<uniform> visual_params: VisualParams; // Use the defined struct name VisualParams
+
+// === VERTEX SHADER ===
 struct VertexInput {
     @location(0) position: vec3<f32>,
 };
@@ -15,9 +35,6 @@ struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
 };
 
-@group(0) @binding(0)
-var<uniform> mvp: mat4x4<f32>;
-
 @vertex
 fn vs_main(model: VertexInput) -> VertexOutput {
     var out: VertexOutput;
@@ -25,9 +42,10 @@ fn vs_main(model: VertexInput) -> VertexOutput {
     return out;
 }
 
+// === FRAGMENT SHADER ===
 @fragment
 fn fs_main() -> @location(0) vec4<f32> {
-    return vec4<f32>(0.8, 0.8, 0.8, 1.0); // Opaque light gray points
+    return visual_params.color; // Access color field of the VisualParams uniform
 }
 "#;
 
@@ -36,26 +54,37 @@ pub struct SphereWgpuPrimitive {
     num_vertices: u32,
     mvp_uniform_buffer: wgpu::Buffer,
     mvp_bind_group: wgpu::BindGroup,
+    visual_params_uniform_buffer: wgpu::Buffer, // For color
+    visual_params_bind_group: wgpu::BindGroup,  // For color
     render_pipeline: wgpu::RenderPipeline,
 }
 
 pub struct WgpuSphereRenderer {
     primitive: Option<Arc<SphereWgpuPrimitive>>,
-    points: Vec<[f32; 3]>, // Original points, needed for reset or complex calcs
+    points: Vec<[f32; 3]>,
     camera_position: Vec3A,
-    pub time: f32,      // Rotation animation
-    current_scale: f32, // Scale factor, driven by audio amplitude calculations
+    pub time: f32,
+    // Visual state based on audio
+    current_scale: f32, // Re-added for overall sphere size animation
+    current_hue: f32,
+    current_saturation: f32,
+    current_value: f32,
+    pub current_color_rgb: [f32; 3],
 }
 
 impl WgpuSphereRenderer {
     pub fn new(points_data: Vec<[f32; 3]>) -> Self {
-        // `current_scale` starts with default scale of 1.0
         Self {
             primitive: None,
             points: points_data,
-            camera_position: Vec3A::new(0.0, 0.0, 4.0),
+            camera_position: Vec3A::new(0.0, 0.0, 4.0), // User's camera position
             time: 0.0,
-            current_scale: 1.25,
+            current_scale: 1.25, // User's initial scale
+            // Initialize color state
+            current_hue: 0.0,
+            current_saturation: 0.5,
+            current_value: 1.0,
+            current_color_rgb: hsv_to_rgb(0.0, 0.5, 1.0),
         }
     }
 
@@ -67,31 +96,17 @@ impl WgpuSphereRenderer {
         if self.primitive.is_some() {
             return Ok(());
         }
-
-        tracing::info!("Preparing WgpuSphereRenderer resources...");
+        tracing::info!("Preparing WgpuSphereRenderer resources (Color Uniform)...");
 
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Sphere Shader"),
             source: wgpu::ShaderSource::Wgsl(SHADERS_WGSL.into()),
         });
 
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Sphere Vertex Buffer"),
-            contents: bytemuck::cast_slice(&self.points),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let num_vertices = self.points.len() as u32;
-
-        let mvp_matrix_initial = Mat4::IDENTITY;
-        let mvp_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Sphere MVP Uniform Buffer"),
-            contents: bytemuck::cast_slice(&[mvp_matrix_initial]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
+        // --- MVP Resources (Group 0) ---
         let mvp_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("Sphere MVP Bind Group Layout"),
+                label: Some("MVP Bind Group Layout"),
                 entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::VERTEX,
@@ -103,7 +118,12 @@ impl WgpuSphereRenderer {
                     count: None,
                 }],
             });
-
+        let mvp_matrix_initial = Mat4::IDENTITY;
+        let mvp_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Sphere MVP Uniform Buffer"),
+            contents: bytemuck::cast_slice(&[mvp_matrix_initial]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
         let mvp_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Sphere MVP Bind Group"),
             layout: &mvp_bind_group_layout,
@@ -113,12 +133,63 @@ impl WgpuSphereRenderer {
             }],
         });
 
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Sphere Render Pipeline Layout"),
-            bind_group_layouts: &[&mvp_bind_group_layout],
-            push_constant_ranges: &[],
+        // --- Visual Params Resources (Group 1 - Color only) ---
+        let visual_params_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Visual Params Bind Group Layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: Some(
+                            std::num::NonZeroU64::new(
+                                std::mem::size_of::<VisualParamsUniform>() as u64
+                            )
+                            .unwrap(),
+                        ),
+                    },
+                    count: None,
+                }],
+            });
+        let visual_params_initial = VisualParamsUniform {
+            color: [
+                self.current_color_rgb[0],
+                self.current_color_rgb[1],
+                self.current_color_rgb[2],
+                1.0,
+            ],
+        };
+        let visual_params_uniform_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Visual Params Uniform Buffer"),
+                contents: bytemuck::bytes_of(&visual_params_initial),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+        let visual_params_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Visual Params Bind Group"),
+            layout: &visual_params_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: visual_params_uniform_buffer.as_entire_binding(),
+            }],
         });
 
+        // --- Vertex Buffer ---
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Sphere Vertex Buffer"),
+            contents: bytemuck::cast_slice(&self.points),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let num_vertices = self.points.len() as u32;
+
+        // --- Pipeline ---
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Sphere Render Pipeline Layout"),
+            bind_group_layouts: &[&mvp_bind_group_layout, &visual_params_bind_group_layout],
+            push_constant_ranges: &[],
+        });
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Sphere Render Pipeline"),
             layout: Some(&pipeline_layout),
@@ -145,11 +216,10 @@ impl WgpuSphereRenderer {
                 strip_index_format: None,
                 front_face: wgpu::FrontFace::Ccw,
                 cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill, // Use Fill
+                polygon_mode: wgpu::PolygonMode::Fill,
                 unclipped_depth: false,
                 conservative: false,
             },
-            // TODO: dig into why this breaks complaining about polygons if not none
             depth_stencil: None,
             multisample: wgpu::MultisampleState {
                 count: 1,
@@ -164,51 +234,72 @@ impl WgpuSphereRenderer {
             num_vertices,
             mvp_uniform_buffer,
             mvp_bind_group,
+            visual_params_uniform_buffer,
+            visual_params_bind_group,
             render_pipeline,
         }));
-
         tracing::info!("WgpuSphereRenderer resources prepared successfully.");
-
         Ok(())
     }
 
-    // Update internal state based on audio analysis data
-    pub fn update_with_audio(&mut self, audio_data: &Option<AudioAnalysisData>) {
-        if let Some(data) = audio_data {
-            // Map RMS amplitude to scale.
-            // Clamp the RMS value to avoid extreme scales (e.g., 0.0 to 1.0).
-            // Apply some scaling factor and a minimum size, ensuring non-negative
-            let clamped_rms = data.rms_amplitude.max(0.0);
-            // These factors (1.5, 0.5) are arbitrary
-            // Scales from 0.5 upwards
-            // self.current_scale = 0.5 + (clamped_rms * 1.5);
-            self.current_scale = 0.75 + (clamped_rms * 2.5);
+    /// Update visual state (color, scale) based on audio playback state and analysis data.
+    pub fn update_visual_state(
+        &mut self,
+        playback_state: PlaybackState,
+        audio_data: &Option<AudioAnalysisData>,
+    ) {
+        self.current_hue = (self.time * 0.05).fract(); // Hue cycles based on time
 
-        // TODO: Implement frequency -> color mapping later
+        let target_saturation;
+        let target_scale; // Target for overall sphere scale
+
+        if playback_state == PlaybackState::Playing {
+            if let Some(data) = audio_data {
+                let amplitude_factor = (data.rms_amplitude * 2.0).clamp(0.0, 1.0); // Normalize RMS somewhat
+                                                                                   // Saturation increases with amplitude
+                target_saturation = 0.5 + amplitude_factor * 0.5;
+                // Scale increases with amplitude (using user's previous logic)
+                target_scale = 0.75 + (amplitude_factor * 2.5); // Map amplitude to scale (0.75 to 3.25 approx)
+            } else {
+                // Playing but no data (silence)
+                target_saturation = 0.5;
+                target_scale = 0.75; // Minimum scale when silent but playing
+            }
         } else {
-            // No audio data - paused, stopped, or between chunks
-            // Optionally decay the scale back to 1.0 smoothly, or just hold the last value.
-            // self.current_scale = (self.current_scale - 1.0) * 0.95 + 1.0;
+            // Idle, Paused, Loaded
+            target_saturation = 0.5; // Idle saturation
+            target_scale = 1.25; // User's default idle scale
         }
-        // Clamp scale between between 0.1x and 5x to prevent excessive size
-        // self.current_scale = self.current_scale.clamp(0.1, 5.0);
+
+        // Smooth towards target values
+        let lerp_factor = 0.1;
+        self.current_saturation += (target_saturation - self.current_saturation) * lerp_factor;
+        self.current_scale += (target_scale - self.current_scale) * lerp_factor;
+
+        // Clamp scale (using user's previous clamping)
         self.current_scale = self.current_scale.clamp(0.75, 7.50);
+
+        // Convert final HSV to RGB
+        self.current_color_rgb = hsv_to_rgb(
+            self.current_hue,
+            self.current_saturation,
+            self.current_value,
+        );
     }
 
-    // Calculate the Model-View-Projection matrix, incorporating current scale.
+    // Calculate MVP matrix, re-applying the overall scale
     pub fn calculate_mvp(&self, aspect_ratio: f32) -> Mat4 {
         let view = Mat4::look_at_rh(
             self.camera_position.into(),
             Vec3A::ZERO.into(),
             Vec3A::Y.into(),
         );
-        // Apply rotation and then scale
+        // Apply rotation AND scale from self.current_scale
         let model = Mat4::from_rotation_y(self.time * 0.4)
             * Mat4::from_rotation_x(self.time * 0.25)
-            * Mat4::from_scale(Vec3A::splat(self.current_scale).into()); // Applies scale uniformly
+            * Mat4::from_scale(Vec3A::splat(self.current_scale).into()); // Re-added scale
 
         let proj = Mat4::perspective_rh_gl(std::f32::consts::FRAC_PI_4, aspect_ratio, 0.1, 100.0);
-
         proj * view * model
     }
 
@@ -216,22 +307,55 @@ impl WgpuSphereRenderer {
         self.primitive.clone()
     }
 
+    // Paint primitive - updates color uniform only
     pub fn paint_primitive<'rp_lifetime>(
         primitive: &'rp_lifetime SphereWgpuPrimitive,
         mvp_matrix: &Mat4,
+        color: &[f32; 3], // Pass color calculated in update_visual_state
+        // point_size removed
         rpass: &mut wgpu::RenderPass<'rp_lifetime>,
         queue: &Arc<wgpu::Queue>,
     ) {
-        // Update the MVP uniform buffer with the combined matrix
         queue.write_buffer(
             &primitive.mvp_uniform_buffer,
             0,
             bytemuck::cast_slice(&[*mvp_matrix]),
         );
 
+        let visual_data = VisualParamsUniform {
+            color: [color[0], color[1], color[2], 1.0],
+        };
+        queue.write_buffer(
+            &primitive.visual_params_uniform_buffer,
+            0,
+            bytemuck::bytes_of(&visual_data),
+        );
+
         rpass.set_pipeline(&primitive.render_pipeline);
         rpass.set_bind_group(0, &primitive.mvp_bind_group, &[]);
+        rpass.set_bind_group(1, &primitive.visual_params_bind_group, &[]); // Color is group 1
         rpass.set_vertex_buffer(0, primitive.vertex_buffer.slice(..));
         rpass.draw(0..primitive.num_vertices, 0..1);
+    }
+}
+
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [f32; 3] {
+    if s <= 0.0 {
+        return [v, v, v];
+    }
+    let h_scaled = h * 6.0;
+    let sector = h_scaled.floor();
+    let f = h_scaled - sector;
+    let p = v * (1.0 - s);
+    let q = v * (1.0 - s * f);
+    let t = v * (1.0 - s * (1.0 - f));
+    match sector as i32 % 6 {
+        0 => [v, t, p],
+        1 => [q, v, p],
+        2 => [p, v, t],
+        3 => [p, q, v],
+        4 => [t, p, v],
+        5 => [v, p, q],
+        _ => unreachable!(),
     }
 }

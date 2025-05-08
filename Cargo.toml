@@ -15,6 +15,7 @@ egui = "0.27.2"
 glam = { version = "0.25", features = [
   "bytemuck",
 ] } # For 3D math, bytemuck is required for glam
+parking_lot = "0.12" # For efficient locking, render sharing
 rand = "0.8" # For point generation
 rodio = { version = "0.17", features = ["mp3"] }
 rustfft = "6.1" # For Fast Fourier Transform (FFT) analysis of audio track slices

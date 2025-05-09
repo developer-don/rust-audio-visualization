@@ -5,15 +5,13 @@ use glam::{Mat4, Vec3A};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
-// Uniform struct - Only color
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Pod, Zeroable)]
 struct VisualParamsUniform {
-    // Rust struct name can remain different if desired
     color: [f32; 4],
 }
 
-// Shader source (WGSL) - Corrected struct usage
+// Shader source (WGSL)
 const SHADERS_WGSL: &str = r#"
 // === UNIFORMS ===
 @group(0) @binding(0)
@@ -54,8 +52,8 @@ pub struct SphereWgpuPrimitive {
     num_vertices: u32,
     mvp_uniform_buffer: wgpu::Buffer,
     mvp_bind_group: wgpu::BindGroup,
-    visual_params_uniform_buffer: wgpu::Buffer, // For color
-    visual_params_bind_group: wgpu::BindGroup,  // For color
+    visual_params_uniform_buffer: wgpu::Buffer,
+    visual_params_bind_group: wgpu::BindGroup,
     render_pipeline: wgpu::RenderPipeline,
 }
 
@@ -64,8 +62,7 @@ pub struct WgpuSphereRenderer {
     points: Vec<[f32; 3]>,
     camera_position: Vec3A,
     pub time: f32,
-    // Visual state based on audio
-    current_scale: f32, // Re-added for overall sphere size animation
+    current_scale: f32,
     current_hue: f32,
     current_saturation: f32,
     current_value: f32,
@@ -77,10 +74,9 @@ impl WgpuSphereRenderer {
         Self {
             primitive: None,
             points: points_data,
-            camera_position: Vec3A::new(0.0, 0.0, 4.0), // User's camera position
+            camera_position: Vec3A::new(0.0, 0.0, 4.0),
             time: 0.0,
-            current_scale: 1.15, // User's initial scale
-            // Initialize color state
+            current_scale: 1.15,
             current_hue: 0.0,
             current_saturation: 0.25,
             current_value: 1.0,
@@ -242,33 +238,30 @@ impl WgpuSphereRenderer {
         Ok(())
     }
 
-    /// Update visual state (color, scale) based on audio playback state and analysis data.
+    /// Update visual state (color, scale) based on audio playback state and analysis data
     pub fn update_visual_state(
         &mut self,
         playback_state: PlaybackState,
         audio_data: &Option<AudioAnalysisData>,
     ) {
-        self.current_hue = (self.time * 0.05).fract(); // Hue cycles based on time
+        // Hue cycles based on time
+        self.current_hue = (self.time * 0.05).fract();
 
         let target_saturation;
-        let target_scale; // Target for overall sphere scale
+        let target_scale;
 
         if playback_state == PlaybackState::Playing {
             if let Some(data) = audio_data {
-                let amplitude_factor = (data.rms_amplitude * 3.0).clamp(0.0, 1.0); // Normalize RMS somewhat
-                                                                                   // Saturation increases with amplitude
+                let amplitude_factor = (data.rms_amplitude * 3.0).clamp(0.0, 1.0);
                 target_saturation = 0.1 + amplitude_factor * 0.9;
-                // Scale increases with amplitude (using user's previous logic)
-                target_scale = 0.75 + (amplitude_factor * 2.5); // Map amplitude to scale (0.75 to 3.25 approx)
+                target_scale = 0.75 + (amplitude_factor * 2.5);
             } else {
-                // Playing but no data (silence)
                 target_saturation = 0.25;
-                target_scale = 0.75; // Minimum scale when silent but playing
+                target_scale = 0.75;
             }
         } else {
-            // Idle, Paused, Loaded
-            target_saturation = 0.25; // Idle saturation
-            target_scale = 1.33; // User's default idle scale
+            target_saturation = 0.25;
+            target_scale = 1.33;
         }
 
         // Smooth towards target values
@@ -276,7 +269,6 @@ impl WgpuSphereRenderer {
         self.current_saturation += (target_saturation - self.current_saturation) * lerp_factor;
         self.current_scale += (target_scale - self.current_scale) * lerp_factor;
 
-        // Clamp scale (using user's previous clamping)
         self.current_scale = self.current_scale.clamp(0.75, 7.50);
         // self.current_saturation = self.current_saturation.clamp(0.0, 1.0);
 
@@ -298,7 +290,7 @@ impl WgpuSphereRenderer {
         // Apply rotation AND scale from self.current_scale
         let model = Mat4::from_rotation_y(self.time * 0.4)
             * Mat4::from_rotation_x(self.time * 0.25)
-            * Mat4::from_scale(Vec3A::splat(self.current_scale).into()); // Re-added scale
+            * Mat4::from_scale(Vec3A::splat(self.current_scale).into());
 
         let proj = Mat4::perspective_rh_gl(std::f32::consts::FRAC_PI_4, aspect_ratio, 0.1, 100.0);
         proj * view * model
@@ -312,8 +304,7 @@ impl WgpuSphereRenderer {
     pub fn paint_primitive<'rp_lifetime>(
         primitive: &'rp_lifetime SphereWgpuPrimitive,
         mvp_matrix: &Mat4,
-        color: &[f32; 3], // Pass color calculated in update_visual_state
-        // point_size removed
+        color: &[f32; 3],
         rpass: &mut wgpu::RenderPass<'rp_lifetime>,
         queue: &Arc<wgpu::Queue>,
     ) {
@@ -334,7 +325,7 @@ impl WgpuSphereRenderer {
 
         rpass.set_pipeline(&primitive.render_pipeline);
         rpass.set_bind_group(0, &primitive.mvp_bind_group, &[]);
-        rpass.set_bind_group(1, &primitive.visual_params_bind_group, &[]); // Color is group 1
+        rpass.set_bind_group(1, &primitive.visual_params_bind_group, &[]);
         rpass.set_vertex_buffer(0, primitive.vertex_buffer.slice(..));
         rpass.draw(0..primitive.num_vertices, 0..1);
     }

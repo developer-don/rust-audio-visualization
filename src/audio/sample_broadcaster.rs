@@ -63,7 +63,6 @@ where
     }
 }
 
-// Implement Iterator for SampleBroadcaster to drive the sample processing and sending
 // TODO: Evaluate `#[inline]` on `next` below to see if it impacts performance.
 impl<S> Iterator for SampleBroadcaster<S>
 where
@@ -81,9 +80,9 @@ where
                 // If the buffer is full, send a clone to the processing thread
                 if self.buffer.len() == self.buffer.capacity() {
                     // Use try_send for non-blocking behavior.
-                    // Drop chunks when / if the processing thread bogs down.
+                    // Drop chunks when / if the processing thread bogs down
                     match self.sample_chunk_sender.try_send(self.buffer.clone()) {
-                        Ok(_) => {} // Successfully sent
+                        Ok(_) => {}
                         Err(mpsc::TrySendError::Full(_)) => {
                             tracing::trace!(
                                 "Sample chunk channel full. Dropping audio analysis chunk."
